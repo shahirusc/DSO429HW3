@@ -1,43 +1,57 @@
 name: Answer hourly quiz
 
+# Two ways this runs:
+#  * Loop (manual "Run workflow", or started by the previous loop): stays up ~5h40m,
+#    checking every 3 minutes, then starts its own replacement. Stops itself after Oct 22.
+#  * schedule / push: one quick check, as a backup.
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may delay a few minutes)
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
   push:
     branches: [main]
 
 permissions:
   contents: write
-
-concurrency:
-  group: answer
-  cancel-in-progress: false
+  actions: write
 
 jobs:
   answer:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355
+    concurrency:
+      group: ${{ github.event_name == 'workflow_dispatch' && 'loop' || 'quick' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Solve new rounds
-        id: solve
-        continue-on-error: true   # still commit best guesses if something is low-confidence
-        run: python run.py
-      - name: Commit and push answers
+      - name: Answer new rounds
+        env:
+          LOOP: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898733+github-actions[bot]@users.noreply.github.com"
-          git add answers
-          if git diff --cached --quiet; then echo "No new rounds."; exit 0; fi
-          git commit -m "Answer rounds $(date -u +%Y-%m-%dT%H:%MZ)"
-          for i in 1 2 3 4 5; do git pull --rebase origin main && git push origin HEAD:main && exit 0; sleep 10; done
-          exit 1
-      - name: Flag low-confidence answers
-        if: steps.solve.outcome == 'failure'
+          end=$(( $(date +%s) + 340*60 ))
+          while true; do
+            git pull -q --rebase origin main || true
+            python run.py || echo "::warning::low-confidence answer(s), see log above"
+            git add answers
+            if ! git diff --cached --quiet; then
+              git commit -qm "Answer rounds $(date -u +%Y-%m-%dT%H:%MZ)"
+              for i in 1 2 3 4 5; do git pull -q --rebase origin main && git push -q origin HEAD:main && break; sleep 10; done
+              echo "Pushed at $(date -u)"
+            fi
+            if [ "$LOOP" != "1" ] || [ "$(date +%s)" -ge "$end" ]; then break; fi
+            sleep 180
+          done
+      - name: Start the next loop
+        if: always() && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "::error::Some questions did not match a known template - check the Solve step log"
-          exit 1
+          # Stop after the assignment: round 168 is released 2026-10-22 20:00 UTC.
+          if [ "$(date -u +%Y%m%d%H)" -lt 2026102300 ]; then
+            gh workflow run answer.yml --ref main -R "${{ github.repository }}"
+          fi
